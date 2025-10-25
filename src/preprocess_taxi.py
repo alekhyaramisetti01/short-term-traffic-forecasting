@@ -1,12 +1,10 @@
-# src/preprocess_taxi.py
-import os, glob
+import os, glob, argparse
 from pyspark.sql import SparkSession, functions as F
 
 NYC_TZ = "America/New_York"
-
 BASE = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-IN_DIR = os.path.join(BASE, "data", "raw","nyc_taxi")
-OUT_DIR = os.path.join(BASE, "data", "processed", "nyc")
+IN_DIR = os.path.join(BASE, "data","raw", "nyc_taxi")
+OUT_DIR = os.path.join(BASE, "data", "processed", "nyc_taxi")
 OUT_TAXI_15M = os.path.join(OUT_DIR, "taxi_demand_15m")
 
 def list_parquets(path):
@@ -16,10 +14,15 @@ def list_parquets(path):
     return paths
 
 def floor_to_15min(col_ts):
-    # Floor timestamp to 15-minute interval
+    # floor timestamp to 15-min (900 sec)
     return F.from_unixtime((F.unix_timestamp(col_ts)/900).cast("bigint")*900).cast("timestamp")
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--start", default="2025-01-01 00:00:00")
+    ap.add_argument("--end",   default="2025-08-31 23:59:59")
+    args = ap.parse_args()
+
     spark = (
         SparkSession.builder
         .appName("Taxi_15m_Aggregation")
@@ -28,13 +31,15 @@ def main():
         .getOrCreate()
     )
 
-    # 1. Read all Parquet files
+    start_lit = F.lit(args.start).cast("timestamp")
+    end_lit   = F.lit(args.end).cast("timestamp")
+
     paths = list_parquets(IN_DIR)
     df = spark.read.parquet(*paths).select(
         "tpep_pickup_datetime", "tpep_dropoff_datetime", "PULocationID"
     )
 
-    # 2. Basic cleaning
+    # hygiene + sane durations + hard clamp to window
     df = (
         df.where(F.col("tpep_pickup_datetime").isNotNull())
           .where(F.col("tpep_dropoff_datetime").isNotNull())
@@ -43,12 +48,12 @@ def main():
               (F.col("tpep_dropoff_datetime") > F.col("tpep_pickup_datetime")) &
               (F.col("tpep_dropoff_datetime") <= F.col("tpep_pickup_datetime") + F.expr("INTERVAL 24 HOURS"))
           )
+          .where((F.col("tpep_pickup_datetime") >= start_lit) &
+                 (F.col("tpep_pickup_datetime") <= end_lit))
     )
 
-    # 3. Add 15-minute time bin
     df = df.withColumn("bin_15m", floor_to_15min(F.col("tpep_pickup_datetime")))
 
-    # 4. Aggregate
     agg = (
         df.groupBy("bin_15m")
           .agg(
@@ -57,38 +62,24 @@ def main():
           )
     )
 
-    # 5. Build continuous 15-min bins
-    bounds = agg.agg(F.min("bin_15m").alias("min_ts"), F.max("bin_15m").alias("max_ts")).collect()[0]
-    start, end = bounds["min_ts"], bounds["max_ts"]
-    if start is None or end is None:
-        raise SystemExit("[ERROR] No rows after filtering; check your input data.")
-
-    cal = (
-        spark.createDataFrame([(start, end)], ["start_ts", "end_ts"])
-             .select(F.explode(F.sequence(F.col("start_ts"), F.col("end_ts"), F.expr("interval 15 minutes"))).alias("bin_15m"))
-    )
+    # fill missing 15-min bins within [start,end]
+    cal = (spark.createDataFrame([(args.start, args.end)], ["start_ts", "end_ts"])
+                 .select(F.explode(F.sequence(F.col("start_ts").cast("timestamp"),
+                                             F.col("end_ts").cast("timestamp"),
+                                             F.expr("interval 15 minutes"))).alias("bin_15m")))
 
     full = (
-        cal.join(agg, on="bin_15m", how="left")
+        cal.join(agg, "bin_15m", "left")
            .select(
                "bin_15m",
-               F.coalesce(F.col("trips_15m"), F.lit(0)).cast("long").alias("trips_15m"),
-               F.coalesce(F.col("unique_PUs_15m"), F.lit(0)).cast("long").alias("unique_PUs_15m")
+               F.coalesce("trips_15m", F.lit(0)).cast("long").alias("trips_15m"),
+               F.coalesce("unique_PUs_15m", F.lit(0)).cast("long").alias("unique_PUs_15m"),
            )
            .orderBy("bin_15m")
     )
 
-    # 6. Save results
-    os.makedirs(OUT_TAXI_15M, exist_ok=True)
-
     full.write.mode("overwrite").parquet(OUT_TAXI_15M)
-
-    # Small CSV sample (last 200 rows)
-    full.orderBy(F.col("bin_15m").desc()).limit(200).coalesce(1).write.mode("overwrite") \
-        .option("header", True) \
-        .csv(os.path.join(OUT_DIR, "sample_taxi_15m_csv"))
-
-    print(f"[OK] Processed files stored at: {OUT_TAXI_15M}")
+    print(f"[OK] Taxi 15-min → {OUT_TAXI_15M}")
     spark.stop()
 
 if __name__ == "__main__":
