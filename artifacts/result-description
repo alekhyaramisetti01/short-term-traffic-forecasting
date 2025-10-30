@@ -1,0 +1,15 @@
+quick breakdown of how the baseline models performed for 15-, 30-, and 60-minute traffic forecasts.
+
+For 15-minute forecasts, the model did really well — on average, predictions were off by about 82 vehicles, and it explained about 97% of the variation in the data.
+
+For 30 minutes, accuracy dropped slightly, with an average error of ~98 vehicles and R² = 0.95.
+
+For 60 minutes, the model was less accurate (MAE ≈ 136, R² ≈ 0.92), which is expected since predicting further ahead is harder.
+
+In simple terms:
+
+Short-term predictions (15 min) are quite accurate.
+
+Medium-term (30 min) is still solid.
+
+Long-term (60 min) is decent but shows more uncertainty.
